@@ -29,7 +29,12 @@ def handle(ws):
     else:
         ws.close()
 
-wsapp = websocket.WebSocketWSGI(handle)
+
+# Set a lower limit of DEFAULT_MAX_FRAME_LENGTH for testing, as
+# sending an 8MiB frame over the loopback interface can trigger a
+# timeout.
+TEST_MAX_FRAME_LENGTH = 50000
+wsapp = websocket.WebSocketWSGI(handle, max_frame_length=TEST_MAX_FRAME_LENGTH)
 
 
 class TestWebSocket(tests.wsgi_test._TestBase):
@@ -228,3 +233,35 @@ class TestWebSocket(tests.wsgi_test._TestBase):
         sock.sendall(b'\x07\xff')  # Weird packet.
         done_with_request.wait()
         assert not error_detected[0]
+
+    def test_large_frame_size_uncompressed_13(self):
+        # Test fix for GHSA-9p9m-jm8w-94p2
+        connect = [
+            "GET /echo HTTP/1.1",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Host: %s:%s" % self.server_addr,
+            "Origin: http://%s:%s" % self.server_addr,
+            "Sec-WebSocket-Version: 13",
+            "Sec-WebSocket-Key: d9MXuOzlVQ0h+qRllvSCIg==",
+        ]
+        sock = eventlet.connect(self.server_addr)
+        sock.sendall(six.b('\r\n'.join(connect) + '\r\n\r\n'))
+        sock.recv(1024)
+        ws = websocket.RFC6455WebSocket(sock, {}, client=True)
+
+        should_still_fit = b"x" * TEST_MAX_FRAME_LENGTH
+        one_too_much = should_still_fit + b"x"
+
+        # send just fitting frame twice to make sure they are fine independently
+        ws.send(should_still_fit)
+        assert ws.wait() == should_still_fit
+        ws.send(should_still_fit)
+        assert ws.wait() == should_still_fit
+        ws.send(one_too_much)
+
+        res = ws.wait()
+        assert res is None # socket closed
+        # close code should be available now
+        assert ws._remote_close_data == b"\x03\xf1Incoming frame of 50001 bytes is above length limit of 50000 bytes."
+        eventlet.sleep(0.01)

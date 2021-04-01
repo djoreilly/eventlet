@@ -35,6 +35,7 @@ for _mod in ('wsaccel.utf8validator', 'autobahn.utf8validator'):
         break
 
 ACCEPTABLE_CLIENT_ERRORS = set((errno.ECONNRESET, errno.EPIPE))
+DEFAULT_MAX_FRAME_LENGTH = 8 << 20
 
 __all__ = ["WebSocketWSGI", "WebSocket"]
 PROTOCOL_GUID = b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
@@ -72,14 +73,20 @@ class WebSocketWSGI(object):
     :class:`WebSocket`.  To close the socket, simply return from the
     function.  Note that the server will log the websocket request at
     the time of closure.
+
+    An optional argument max_frame_length can be given, which will set the
+    maximum incoming *uncompressed* payload length of a frame. By default, this
+    is set to 8MiB. Note that excessive values here might create a DOS attack
+    vector.
     """
 
-    def __init__(self, handler):
+    def __init__(self, handler, max_frame_length=DEFAULT_MAX_FRAME_LENGTH):
         self.handler = handler
         self.protocol_version = None
         self.support_legacy_versions = True
         self.supported_protocols = []
         self.origin_checker = None
+        self.max_frame_length = max_frame_length
 
     @classmethod
     def configured(cls,
@@ -240,7 +247,8 @@ class WebSocketWSGI(object):
             handshake_reply.append(b"Sec-WebSocket-Protocol: " + six.b(negotiated_protocol))
         sock.sendall(b'\r\n'.join(handshake_reply) + b'\r\n\r\n')
         return RFC6455WebSocket(sock, environ, self.protocol_version,
-                                protocol=negotiated_protocol)
+                                protocol=negotiated_protocol,
+                                max_frame_length=self.max_frame_length)
 
     def _extract_number(self, value):
         """
@@ -420,11 +428,14 @@ class ProtocolError(ValueError):
 
 
 class RFC6455WebSocket(WebSocket):
-    def __init__(self, sock, environ, version=13, protocol=None, client=False):
+    def __init__(self, sock, environ, version=13, protocol=None, client=False,
+                 max_frame_length=DEFAULT_MAX_FRAME_LENGTH):
         super(RFC6455WebSocket, self).__init__(sock, environ, version)
         self.iterator = self._iter_frames()
         self.client = client
         self.protocol = protocol
+        self.max_frame_length = max_frame_length
+        self._remote_close_data = None
 
     class UTF8Decoder(object):
         def __init__(self):
@@ -457,11 +468,12 @@ class RFC6455WebSocket(WebSocket):
         return data
 
     class Message(object):
-        def __init__(self, opcode, decoder=None):
+        def __init__(self, opcode, max_frame_length, decoder=None):
             self.decoder = decoder
             self.data = []
             self.finished = False
             self.opcode = opcode
+            self.max_frame_length = max_frame_length
 
         def push(self, data, final=False):
             if self.decoder:
@@ -481,6 +493,7 @@ class RFC6455WebSocket(WebSocket):
 
     def _handle_control_frame(self, opcode, data):
         if opcode == 8:  # connection close
+            self._remote_close_data = data
             if not data:
                 status = 1000
             elif len(data) > 1:
@@ -575,12 +588,16 @@ class RFC6455WebSocket(WebSocket):
             length = struct.unpack('!H', recv(2))[0]
         elif length == 127:
             length = struct.unpack('!Q', recv(8))[0]
+
+        if length > self.max_frame_length:
+            raise FailedConnectionError(1009, "Incoming frame of {} bytes is above length limit of {} bytes.".format(
+                length, self.max_frame_length))
         if masked:
             mask = struct.unpack('!BBBB', recv(4))
         received = 0
         if not message or opcode & 8:
             decoder = self.UTF8Decoder() if opcode == 1 else None
-            message = self.Message(opcode, decoder=decoder)
+            message = self.Message(opcode, self.max_frame_length, decoder=decoder)
         if not length:
             message.push(b'', final=finished)
         else:
